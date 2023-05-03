@@ -46,7 +46,6 @@ from torchvision.models import resnet18   # added resnet18 model
 from timm.models import ConvNeXt   # imported ConvNeXt from timm
 import tensorflow as tf
 from torch.utils.tensorboard import SummaryWriter
-#writer = SummaryWriter()
 
 parser = argparse.ArgumentParser(
     description='Trains a CIFAR Classifier',

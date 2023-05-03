@@ -34,11 +34,19 @@ from third_party.ResNeXt_DenseNet.models.densenet import densenet
 from third_party.ResNeXt_DenseNet.models.resnext import resnext29
 from third_party.WideResNet_pytorch.wideresnet import WideResNet
 
+import timm   # added timm library for convnext_tiny implementation
 import torch
 import torch.backends.cudnn as cudnn
 import torch.nn.functional as F
+import torch.nn as nn
+from torch.nn import Linear
 from torchvision import datasets
 from torchvision import transforms
+from torchvision.models import resnet18   # added resnet18 model
+from timm.models import ConvNeXt   # imported ConvNeXt from timm
+import tensorflow as tf
+from torch.utils.tensorboard import SummaryWriter
+#writer = SummaryWriter()
 
 parser = argparse.ArgumentParser(
     description='Trains a CIFAR Classifier',
@@ -54,9 +62,16 @@ parser.add_argument(
     '-m',
     type=str,
     default='wrn',
-    choices=['wrn', 'allconv', 'densenet', 'resnext'],
+    choices=['wrn', 'allconv', 'densenet', 'resnext','resnet18_pt','resnet18_npt','convnext_tiny_pt','convnext_tiny_npt'],   # adding all the newly added models to the list of choices
     help='Choose architecture.')
 # Optimization options
+parser.add_argument(
+    '--optimizer', 
+    '-o', 
+    type=str, 
+    default='sgd',
+    choices=['sgd', 'adamw'],
+    help='Choose optimizer.')
 parser.add_argument(
     '--epochs', '-e', type=int, default=100, help='Number of epochs to train.')
 parser.add_argument(
@@ -75,6 +90,14 @@ parser.add_argument(
     type=float,
     default=0.0005,
     help='Weight decay (L2 penalty).')
+# Scheduler options
+parser.add_argument(
+    '--scheduler',
+    '-S',
+    type = str,
+    default = 'lambdalr',
+    choices=['lambdalr', 'cosineannealinglr'],
+    help = 'Choose scheduler.')
 # WRN Architecture options
 parser.add_argument(
     '--layers', default=40, type=int, help='total number of layers')
@@ -142,6 +165,12 @@ CORRUPTIONS = [
     'jpeg_compression'
 ]
 
+PERTURBATIONS = [
+  'brightness', 'gaussian_blur', 'gaussian_noise_2', 'gaussian_noise_3', 'gaussian_noise',
+  'motion_blur', 'rotate', 'scale', 'shear', 'shot_noise_2', 'shot_noise_3', 'shot_noise',
+  'snow', 'spatter', 'speckle_noise_2', 'speckle_noise_3', 'speckle_noise', 'tilt', 'translate',
+  'zoom_blur'
+]
 
 def get_lr(step, total_steps, lr_max, lr_min):
   """Compute learning rate according to cosine annealing schedule."""
@@ -285,10 +314,53 @@ def test_c(net, test_data, base_path):
 
   return np.mean(corruption_accs)
 
+"""Robustness(https://github.com/hendrycks/robustness/blob/master/ImageNet-P/cifar-p-eval.py)."""
+def flip_prob(predictions, noise_perturbation=False):
+    result = 0
+    step_size = 1
+    for vid_preds in predictions:
+        result_for_vid = []
+
+        for i in range(step_size):
+            prev_pred = vid_preds[i]
+
+            for pred in vid_preds[i::step_size][1:]:
+                result_for_vid.append(int(prev_pred != pred))
+                if not noise_perturbation: prev_pred = pred
+
+        result += np.mean(result_for_vid) / len(predictions)
+    return result
+
+"""Robustness(https://github.com/hendrycks/robustness/blob/master/ImageNet-P/cifar-p-eval.py)."""
+def test_p(net, base_path,num_classes):
+  """Evaluate network on  given perturbated dataset."""
+  flip_list = []
+  for perturbation in PERTURBATIONS:
+    dataset = torch.from_numpy(np.float32(np.load(base_path + perturbation +'.npy').transpose((0,1,4,2,3))))/255.
+    loader = torch.utils.data.DataLoader(
+        dataset, batch_size=args.eval_batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
+
+    predictions = []
+    with torch.no_grad():
+      for data in loader:
+          num_vids = data.size(0)
+          data = data.view(-1,3,32,32).cuda()
+
+          output = net(data * 2 - 1)
+
+          for vid in output.view(num_vids, -1, num_classes):
+              predictions.append(vid.argmax(1).to('cpu').numpy())
+      current_flip = flip_prob(predictions, True if 'noise' in perturbation else False)
+      flip_list.append(current_flip)
+      print('{}\n\t Flipping Rate {:.3f}'.format(perturbation, current_flip))
+    
+  return np.mean(flip_list)
 
 def main():
   torch.manual_seed(1)
   np.random.seed(1)
+  
+  writer = SummaryWriter(comment='-' + args.model + '-' + args.optimizer + '-' + args.scheduler)
 
   # Load datasets
   train_transform = transforms.Compose(
@@ -305,6 +377,7 @@ def main():
     test_data = datasets.CIFAR10(
         './data/cifar', train=False, transform=test_transform, download=True)
     base_c_path = './data/cifar/CIFAR-10-C/'
+    base_p_path = './data/cifar/CIFAR-10-P/'
     num_classes = 10
   else:
     train_data = datasets.CIFAR100(
@@ -338,13 +411,32 @@ def main():
     net = AllConvNet(num_classes)
   elif args.model == 'resnext':
     net = resnext29(num_classes=num_classes)
+  # added the new models to the code viz. resnet18 and convnext_tiny
+  elif args.model == 'resnet18_pt':
+    net = resnet18(pretrained=True)
+    num_ftrs = net.fc.in_features
+    net.fc = nn.Linear(num_ftrs,num_classes)
+  elif args.model == 'resnet18_npt':
+    net = resnet18(num_classes=num_classes)
+  elif args.model == 'convnext_tiny_pt':
+    net = timm.create_model("convnext_tiny", pretrained=True)
+    input_features = net.get_classifier().in_features; input_features
+    net.fc = Linear (input_features, num_classes)
+  elif args.model == 'convnext_tiny_npt':
+    net = timm.create_model("convnext_tiny", num_classes=num_classes)
 
-  optimizer = torch.optim.SGD(
+  if args.optimizer == 'sgd':
+    optimizer = torch.optim.SGD(
       net.parameters(),
       args.learning_rate,
       momentum=args.momentum,
       weight_decay=args.decay,
       nesterov=True)
+  elif args.optimizer == 'adamw':
+    optimizer = torch.optim.AdamW(
+      net.parameters(),
+      lr=args.learning_rate,
+      weight_decay=args.decay)
 
   # Distribute model across all visible GPUs
   net = torch.nn.DataParallel(net).cuda()
@@ -371,13 +463,20 @@ def main():
     print('Mean Corruption Error: {:.3f}'.format(100 - 100. * test_c_acc))
     return
 
-  scheduler = torch.optim.lr_scheduler.LambdaLR(
+  if args.scheduler == 'lambdalr':
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
       optimizer,
       lr_lambda=lambda step: get_lr(  # pylint: disable=g-long-lambda
           step,
           args.epochs * len(train_loader),
           1,  # lr_lambda computes multiplicative factor
           1e-6 / args.learning_rate))
+  elif args.scheduler == 'cosineannealinglr':
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+      optimizer, 
+      T_max=args.epochs * len(train_loader),
+      eta_min= 1e-6 / args.learning_rate
+      )
 
   if not os.path.exists(args.save):
     os.makedirs(args.save)
@@ -427,14 +526,26 @@ def main():
         ' Test Error {4:.2f}'
         .format((epoch + 1), int(time.time() - begin_time), train_loss_ema,
                 test_loss, 100 - 100. * test_acc))
+    
+  # tensorboard implementation and logging train and test loss and accuracy
+    writer.add_scalar('Loss/train', train_loss_ema, epoch+1)
+    writer.add_scalar('Loss/test', test_loss, epoch+1)
+    writer.add_scalar('Accuracy/test', test_acc, epoch+1)
 
   test_c_acc = test_c(net, test_data, base_c_path)
   print('Mean Corruption Error: {:.3f}'.format(100 - 100. * test_c_acc))
-
+  
+  if args.dataset == 'cifar10':
+    test_p_acc = test_p(net, base_p_path, num_classes)
+    print('Mean Flipping Rate: {:.3f}'.format(test_p_acc))
+    
+  writer.close()
+  
   with open(log_path, 'a') as f:
     f.write('%03d,%05d,%0.6f,%0.5f,%0.2f\n' %
             (args.epochs + 1, 0, 0, 0, 100 - 100 * test_c_acc))
-
+  
+  
 
 if __name__ == '__main__':
   main()

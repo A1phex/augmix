@@ -1,3 +1,5 @@
-logs/
-main.log
-*.log
+*.tar
+*.csv
+*.pyc
+data
+AugmixJ-venv
